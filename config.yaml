@@ -1,0 +1,35 @@
+# 工具的全局配置
+tools:
+  rag:
+    max_retries: 2
+    timeout: 30
+    max_content_chars: 800
+
+  excel:
+    # 默认工作模式 (可选: timestamp, overwrite, append)
+    mode: "timestamp"
+    # 是否保留时间戳备份
+    keep_backup: false
+
+  search:
+    max_retries: 2
+    timeout: 15
+    max_search_results: 10
+
+  vector_store:
+    data_dir: "./data"
+    HASH_RECORD_PATH: "./chroma_db/file_hashes.json"
+
+core:
+  agent:
+    # 每个会话最多保留的消息条数
+    MAX_HISTORY_MESSAGES: 20
+
+# 大模型参数配置
+llm:
+  model: "deepseek/deepseek-chat"
+  llm_temperature: 0.2
+  llm_max_tokens: 2048
+  llm_timeout: 60
+  llm_retries: 2
+

@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+outputs/
+*.sqlite3
+
+# 忽略所有的数据库和庞大的数据文件夹
+chroma_db/
+data/
+data(20260206)/
+隔离区文档/

@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-03-31T20:20:31",
+  "total_samples": 50,
+  "global": {
+    "context_precision": 0.01,
+    "context_recall": 0.02,
+    "faithfulness": 0.8418,
+    "n": 50
+  },
+  "by_industry": {
+    "能源金属": {
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "faithfulness": 0.8717,
+      "n": 10
+    },
+    "互联网电商": {
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "faithfulness": 0.8386,
+      "n": 14
+    },
+    "半导体": {
+      "context_precision": 0.0455,
+      "context_recall": 0.0909,
+      "faithfulness": 0.8409,
+      "n": 11
+    },
+    "电力": {
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "faithfulness": 1.0,
+      "n": 4
+    },
+    "教育": {
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "faithfulness": 0.86,
+      "n": 5
+    },
+    "房地产开发": {
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "faithfulness": 0.6805,
+      "n": 6
+    }
+  }
+}

@@ -11,11 +11,23 @@ from react_agent.rag.semantic_cache import get_cached_result, set_cached_result
 
 @tool(
     description=(
-        # BUG-FIX: 原描述是数学/PDE 项目的遗留内容，Agent 路由时依赖此描述判断是否调用本工具
-        # 错误描述 = Agent 在金融问题上可能跳过本工具直接瞎编
-        "查询金融研报知识库，包含 A 股上市公司年报、行业研究报告、券商研报、政策文件等 PDF 内容。"
-        "当用户询问公司财务数据、行业分析、盈利预测、估值、政策解读等金融专业问题时，必须优先使用此工具。"
-        "输入应为精炼的金融关键词，例如：公司名称、指标名称、行业名称、报告期等。"
+        "【触发条件】用户询问以下内容时，必须第一个调用本工具：\n"
+        "  - 具体公司的财务数据（营收、毛利率、净利润、负债率等）\n"
+        "  - 行业研究结论、券商观点、评级、目标价、盈利预测\n"
+        "  - 政策文件、监管规定的具体条款\n"
+        "  - 研报中的表格数据、图表数据、量化指标\n"
+        "  示例 query：'比亚迪2023Q3毛利率'、'新能源行业政策'、'中芯国际目标价'\n\n"
+        "【不触发条件】以下情况不使用本工具：\n"
+        "  - 问题是通用概念解释（如'什么是PE'），无需查文献\n"
+        "  - 用户明确要求搜索互联网最新新闻\n\n"
+        "【与 search 的优先级】本工具优先于 search；"
+        "只有本工具返回 has_relevant_content=False 后，才允许考虑是否调用 search。\n\n"
+        "【输入】精炼的金融关键词，包含：公司名 + 指标 + 报告期（已知时）\n"
+        "  好的输入：'比亚迪 毛利率 2023'\n"
+        "  差的输入：'请帮我查一下比亚迪最近的情况'\n\n"
+        "【输出关键字段】\n"
+        "  data.results[].content   — 文档片段，已含来源路径和页码前缀，可直接在回答中引用\n"
+        "  data.has_relevant_content — False 时必须告知用户未找到，禁止编造"
     )
 )
 @with_retry(
@@ -81,49 +93,52 @@ async def query_internal_knowledge(query: str) -> dict:
         if cached_docs is not None:
             max_chars = settings.tools.rag.max_content_chars
             results = _build_results(cached_docs, max_chars)
+            hrc = len(results) > 0
             return _ok(
                 tool_name=tool_name,
                 query=q,
-                data={"results": results, "has_relevant_content": len(results) > 0},
+                data={"results": results, "has_relevant_content": hrc},
                 meta={"retrieved_count": len(results), "candidates_count": 0,
-                      "stage": "semantic_cache_hit"}
+                      "stage": "semantic_cache_hit", "has_relevant_content": hrc}
             )
 
         # ════ 第一步：双路召回（BM25 + 向量） ════
         candidates = await _dual_retrieve(q)
 
         if not candidates:
+            hrc = False
             return _ok(
                 tool_name=tool_name,
                 query=q,
-                data={"results": [], "has_relevant_content": False},
+                data={"results": [], "has_relevant_content": hrc},
                 # BUG-FIX: 原代码此处 meta 缺少 candidates_count 字段，与有结果路径不一致
                 meta={"retrieved_count": 0, "candidates_count": 0,
-                      "stage": "dual_retrieve_empty"}
+                      "stage": "dual_retrieve_empty", "has_relevant_content": hrc}
             )
 
         # ════ 第二步：Reranker 精排，取 Top-3 ════
-        docs = await _rerank(q, candidates, top_n=3)
+        docs, top_score = await _rerank(q, candidates, top_n=3)
 
         # 精排后写入语义缓存（仅在有结果时）
-        if docs:
-            await set_cached_result(q, docs)
+        await set_cached_result(q, docs, top_score=top_score)
 
         # ════ 第三步：构造返回结果 ════
         max_chars = settings.tools.rag.max_content_chars
         results = _build_results(docs, max_chars)
+        hrc = len(docs) > 0
 
         return _ok(
             tool_name=tool_name,
             query=q,
             data={
                 "results": results,
-                "has_relevant_content": len(docs) > 0
+                "has_relevant_content": hrc
             },
             meta={
                 "retrieved_count":  len(results),
                 "candidates_count": len(candidates),
-                "stage": "dual_retrieve + rerank"
+                "stage": "dual_retrieve + rerank",
+                "has_relevant_content": hrc
             }
         )
 
@@ -161,11 +176,12 @@ def _build_results(docs: list, max_chars: int) -> list:
         raw_content = _trim_text(doc.page_content, max_chars)
         source_path = doc.metadata.get("source", "unknown")
         page = doc.metadata.get("page", -1)   # pdf_parser.py 注入的页码
+        industry = doc.metadata.get("industry", "unknown")
 
         # 把来源和页码拼到正文最前面
         # LLM 读到此格式可以在回答中直接引用："根据 xxx.pdf 第 N 页……"
-        if page >= 0:
-            prefix = f"[来源：{source_path}  第 {page + 1} 页]"  # page 从 0 开始，展示时 +1
+        if page >= 1:
+            prefix = f"[来源：{source_path}  第 {page} 页]"  # page 从 1 开始
         else:
             prefix = f"[来源：{source_path}]"
 
@@ -173,5 +189,6 @@ def _build_results(docs: list, max_chars: int) -> list:
             "content": f"{prefix}\n{raw_content}",
             "source":  source_path,
             "page":    page,
+            "industry": industry
         })
     return results

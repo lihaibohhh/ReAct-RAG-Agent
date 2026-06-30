@@ -40,29 +40,27 @@ def process_file(file_path: str):
     ext = Path(file_path).suffix.lower()
     filename = Path(file_path).name
 
-    # ── 路径 A：表格文件 ────────────────────────────────────────────────
-    if ext in (".xlsx", ".xls", ".csv"):
-        docs = load_table_file(file_path)
-        print(f"      （表格模式：{len(docs)} 行）")
-        return docs
-
-    # ── 路径 B：PDF —— 已由 pdf_parser 完成版面分析 + 分块，直接透传 ──
     if ext in _PDF_PRECHUNKED_EXTS:
-        docs = load_file(file_path)  # 内部调用 load_pdf_with_layout
-        if not docs:
+        doc = load_file(file_path)
+        if not doc:
             return []
-        # pdf_parser 已注入 chunk_id，此处统计并打印摘要
-        n_text = sum(1 for d in docs if d.metadata.get("doc_type") == "text")
-        n_table = sum(1 for d in docs if d.metadata.get("doc_type") == "table")
-        print(f"（文字块 {n_text} 个 / 表格块 {n_table} 个）")
-        return docs
 
-    # ── 路径 C：普通文档 —— 加载后再分块 ──────────────────────────────
-    docs = load_file(file_path)
-    if not docs:
-        return []
-    splitter = get_splitter(file_path)
-    chunks = splitter.split_documents(docs)
-    for i, chunk in enumerate(chunks):
-        chunk.metadata["chunk_id"] = f"{filename}::chunk_{i}"
-    return chunks
+        n_text = sum(1 for d in doc if d.metadata.get("doc_type")=="text")
+        n_table = sum(1 for d in doc if d.metadata.get("doc_type")=="table")
+        print(f"已加载{n_text}个文本块；已加载{n_table}个表格块")
+        return doc
+
+    if ext in {".xlsx", ".xls", ".csv"}:
+        doc = load_table_file(file_path)
+        if not doc:
+            return []
+        return doc
+    else:
+        doc = load_file(file_path)
+        if not doc:
+            return []
+        split_tool = get_splitter(file_path)
+        chunks = split_tool.split_documents(doc)
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_id"] = f"{i+1}个chunk && {filename}"
+        return chunks

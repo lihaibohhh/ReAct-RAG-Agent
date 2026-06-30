@@ -1,0 +1,39 @@
+version: '3.8' # 告诉 Docker 使用什么版本的语法规则
+
+services:
+  # ==========================================
+  # 部队 1：后勤保障部队 - Redis Stack (包含向量检索功能)
+  # ==========================================
+  redis-stack:
+    image: redis/redis-stack:latest # 直接从云端拉取现成的镜像
+    container_name: agent-redis
+    ports:
+      - "6379:6379" # 映射数据端口，左边是宿主机(你的电脑)，右边是容器内
+      - "8001:8001" # 映射 RedisInsight 可视化面板端口
+    volumes:
+      # 重要！把容器里的 /data 数据夹映射到电脑上的 redis-data 文件夹里
+      # 这样重启容器后，你的缓存数据才不会丢失
+      - ./redis-data:/data
+    restart: always # 如果崩溃了，自动重启
+
+  # ==========================================
+  # 部队 2：主力作战部队 - 你的 Agent 应用
+  # ==========================================
+  agent-app:
+    build: .
+    container_name: react-agent
+    ports:
+      - "8501:8501"
+    depends_on:
+      - redis-stack
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ./outputs:/app/outputs
+    environment:
+      - REDIS_URL=redis://redis-stack:6379
+      - PYTHONPATH=/app   # <--- 就是加了这一行！告诉 Python 根目录在哪里
+      - HF_ENDPOINT=https://hf-mirror.com
+    env_file:
+      - .env
+    restart: always

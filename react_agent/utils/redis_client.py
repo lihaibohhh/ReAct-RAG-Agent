@@ -3,8 +3,11 @@ from __future__ import annotations
 import threading
 import redis.asyncio as aioredis
 import redis as sync_redis
+import logging
 from react_agent.core.config import settings
 
+
+logger = logging.getLogger(__name__)
 _async_pool: aioredis.ConnectionPool | None = None
 _sync_pool: sync_redis.ConnectionPool | None = None
 _lock = threading.Lock()
@@ -45,5 +48,5 @@ async def ping_redis() -> bool:
         await r.ping()
         return True
     except Exception as e:
-        print(f"[Redis] ⚠️ 连接失败: {e}，将降级为本地模式")
+        logger.info(f"[Redis] ⚠️ 连接失败: {e}，将降级为本地模式")
         return False

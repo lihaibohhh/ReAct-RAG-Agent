@@ -2,8 +2,13 @@ from __future__ import annotations
 import os
 import asyncio
 import threading
+import logging
+import torch
 
 
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+logger = logging.getLogger(__name__)
 _reranker_retriever_instance = None     # 缓存 BGE Reranker 精排器
 _reranker_lock = threading.Lock()       # 线程安全锁：保护 _reranker_retriever_instance 初始化
 
@@ -35,14 +40,14 @@ def _get_reranker():
 
         # BUG-FIX: 默认模型升级为 bge-reranker-v2-m3（图片技术选型表推荐）
         model_name = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-        reranker_model = HuggingFaceCrossEncoder(model_name=model_name)
-        print(f"[RAG] ✅ Reranker 初始化完成（{model_name}）")
+        reranker_model = HuggingFaceCrossEncoder(model_name=model_name, model_kwargs={"device": _DEVICE})
+        logger.info(f"[RAG] ✅ Reranker 初始化完成（{model_name}）")
 
         _reranker_retriever_instance = reranker_model
         return _reranker_retriever_instance
 
 
-async def _rerank(q: str, docs: list, top_n: int = 3) -> list:
+async def _rerank(q: str, docs: list, top_n: int = 3) -> tuple[list, float]:
     """
     使用 Cross-Encoder 对候选文档进行精排。
 
@@ -66,7 +71,7 @@ async def _rerank(q: str, docs: list, top_n: int = 3) -> list:
       list[Document]，按相关性从高到低，最多 top_n 条
     """
     if not docs:
-        return []
+        return [], 0.0
 
     try:
         reranker = await asyncio.to_thread(_get_reranker)
@@ -76,29 +81,35 @@ async def _rerank(q: str, docs: list, top_n: int = 3) -> list:
 
         scored = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
 
-        # BUG-FIX: 默认阈值从 0.1 修正为 -5
-        # 原因：bge-reranker 输出 logit（非概率），0.1 会过滤掉大量相关金融段落
+        # bge-reranker 输出 logit（非概率），阈值设为0.1
         # 调优建议：先跑几个 query 打印 scores，再决定是否需要调整
-        threshold = float(os.getenv("RERANKER_THRESHOLD", "-5"))
+        threshold = float(os.getenv("RERANKER_THRESHOLD", "0.1"))
 
         filtered = [(score, doc) for score, doc in scored if score > threshold]
 
         if not filtered:
             # 全部低于阈值：说明知识库确实没有相关内容（而非阈值设错）
             # 此时返回空，由 rag.py 向上层返回 has_relevant_content=False
-            print(f"[RAG] ℹ️ Reranker 全部低于阈值({threshold})，判定为无相关内容")
-            return []
+            logger.info(f"[RAG] ℹ️ Reranker 全部低于阈值({threshold})，判定为无相关内容")
+            return [], 0.0
 
         # 打印 Top 分数，方便调试阈值（生产环境可关闭）
+            # 打印全部分数分布，方便调试阈值边界（生产环境可关闭）
         if os.getenv("RERANKER_DEBUG", "0") == "1":
-            for score, doc in scored[:top_n]:
+            logger.info(f"[RAG][DEBUG] === Reranker 评分分布 (阈值: {threshold}) ===")
+            # 采纳你的建议：遍历所有 scored，而不是 [:top_n]
+            for score, doc in scored:
                 cid = doc.metadata.get("chunk_id", "?")
-                print(f"[RAG][DEBUG] score={score:.3f}  chunk={cid}")
+                # 加个小标记，直观看出哪些过了阈值，哪些被拦住了
+                status = "✅ 留存" if score > threshold else "❌ 淘汰"
+                logger.info(f"[RAG][DEBUG] {status} | score={score:>6.3f} | chunk={cid}")
+            logger.info("[RAG][DEBUG] ===============================================")
 
-        return [doc for _, doc in filtered[:top_n]]
+        top_score = filtered[0][0]
+        return [doc for _, doc in filtered[:top_n]], top_score
 
     except Exception as e:
         # BUG-FIX: 原代码 except 直接 return []，Reranker 一旦出错整条链路返回空
         # 修正为降级返回 RRF 排序结果，保证链路不断裂
-        print(f"[RAG] ⚠️ Reranker 失败（{type(e).__name__}: {e}），降级返回 RRF Top-{top_n}")
-        return docs[:top_n]
+        logger.info(f"[RAG] ⚠️ Reranker 失败（{type(e).__name__}: {e}），降级返回 RRF Top-{top_n}")
+        return docs[:top_n], 0.0

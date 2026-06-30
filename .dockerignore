@@ -1,0 +1,13 @@
+# 忽略本地的虚拟环境
+.venv
+env/
+__pycache__/
+
+# 忽略本地的向量数据库和测试数据
+chroma_db/
+data/
+outputs/
+
+# 忽略 Git 记录和环境变量文件（保护密钥安全）
+.git
+.env

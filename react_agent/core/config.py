@@ -100,7 +100,7 @@ class SecretsConfig(BaseModel):
 class LLMConfig(BaseModel):
     """LLM 推理参数：可通过 .env 或 config.yaml 覆盖"""
 
-    model: str = Field(default="deepseek/deepseek-chat")
+    model: str = Field(default="deepseek/deepseek-v4-flash")
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     llm_max_tokens: int = Field(default=2048, gt=0)
     llm_timeout: int = Field(default=60, gt=0)
@@ -200,11 +200,16 @@ class DatabaseConfig(BaseModel):
     HASH_RECORD_PATH: str = str(_PROJECT_ROOT / "src" / "chroma_db" / "file_hashes.json")
 
 
+class SqlDataConfig(BaseModel):
+    DB_PATH: str = str(_PROJECT_ROOT / "src" / "data_sql" / "financials.db")
+
+
 class ToolsConfig(BaseModel):
     rag:          RagConfig = RagConfig()
     excel:        ExcelConfig = ExcelConfig()
     search:       SearchConfig = SearchConfig()
     vector_store: DatabaseConfig = DatabaseConfig()
+    sql_store:    SqlDataConfig = SqlDataConfig()
 
 
 class AgentCoreConfig(BaseModel):

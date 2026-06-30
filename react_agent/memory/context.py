@@ -9,11 +9,14 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field, fields
 from typing import Annotated, Any, Optional, get_args, get_origin
 from typing import get_type_hints
 
 from react_agent.core import prompts
+
+logger = logging.getLogger(__name__)
 
 
 def _to_bool(s: str):
@@ -145,8 +148,9 @@ class Context:
     )
 
     max_search_results: int = field(
-        default=10,
-        metadata={"description": "搜索工具返回的最大结果条数（传给 TavilySearch）。"},
+        default=5,
+        metadata={"description": "搜索工具返回的最大结果条数（传给 TavilySearch）。"
+                                 "Tavily 前 5 条质量通常足够，直接减半单条工具结果体量。"},
     )
 
     # 工具返回体积控制：你 tools.py 已经 shrink 了，这里再给一个全局硬限制（建议）
@@ -164,6 +168,17 @@ class Context:
         metadata={"description": "LangGraph 递归/步数上限（防止死循环）。"},
     )
 
+    rag_call_limit: int = field(
+        default=3,
+        metadata={"description": "单轮对话内 query_internal_knowledge 调用次数硬上限（兜底防御，与上层提示词策略无关）。"},
+    )
+
+    consecutive_failure_threshold: int = field(
+        default=2,
+        metadata={"description": "RAG 连续无效检索（has_relevant_content=False）次数达到该值后强制拒答终止。"
+                                 "该值会注入 system_prompt 的拒答规则文案，修改此项无需再手动同步 prompts.py。"},
+    )
+
     tool_timeout_seconds: int = field(
         default=30,
         metadata={"description": "工具调用超时（秒）。你可在工具层或 node 层统一应用。"},
@@ -175,9 +190,9 @@ class Context:
 
     # 只按条数截断是最简单可靠的工程策略（后续可升级成按 token 预算）
     max_history_tokens: int = field(
-        default=6000,
+        default=64000,
         metadata={"description": "发给模型前保留的最大历史 token 数（不含本轮 system prompt）。"
-                                 "建议设为模型上下文窗口的 40%~60%，给 completion 留足空间。"},
+                                 "按模型窗口 40%~60% 取值，给 completion 留足空间。"},
     )
 
     # 如果你在 graph.py 里实现摘要/压缩，可用此开关控制
@@ -213,7 +228,7 @@ class Context:
     # -----------------------------
 
     debug: bool = field(
-        default=True,
+        default=False,
         metadata={"description": "调试模式：更详细的日志/trace。"},
     )
 
@@ -230,13 +245,12 @@ class Context:
         metadata={"description": "是否统计 token 与估算费用（OpenAI usage）"},
     )
     # 例："input": 0.80表示0.8美元 / 100 万 tokens
-    openai_price_per_1m_tokens: dict = field(
+    deepseek_v4_price: dict = field(
         default_factory=lambda: {
-            "gpt-4.1-mini": {"input": 0.80, "output": 3.20, "cached_input": 0.20},
-            "gpt-4.1": {"input": 3.00, "output": 12.00, "cached_input": 0.75},
-            "gpt-4o-mini": {"input": 0.30, "output": 1.20, "cached_input": 0.15},
+            "deepseek-v4-flash": {"cache_hit": 0.0028, "cache_miss": 0.14, "output": 0.28},
+            "deepseek-v4-pro": {"cache_hit": 0.003625, "cache_miss": 0.435, "output": 0.87}
         },
-        metadata={"description": "OpenAI 模型单价（$/1M tokens），用于估算成本"},
+        metadata={"description": "deepseek-v4 模型单价（$/1M tokens），用于估算成本"},
     )
 
     # -----------------------------
@@ -267,7 +281,7 @@ class Context:
             except Exception:
                 # 更工程化：转换失败就忽略覆盖（不把字符串写进去埋雷）
                 if getattr(self, "debug", False):
-                    print(f"[Context] ⚠️ env {env_key}={raw!r} 无法转换为 {tp}，已忽略覆盖")
+                    logger.info(f"[Context] ⚠️ env {env_key}={raw!r} 无法转换为 {tp}，已忽略覆盖")
                 continue
 
 

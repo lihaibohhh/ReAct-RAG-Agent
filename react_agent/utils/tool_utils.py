@@ -1,10 +1,54 @@
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, Tuple
-from langchain_core.messages import AnyMessage, ToolMessage, HumanMessage
+from typing import Any, Dict, List, Optional
+from langchain_core.messages import AnyMessage, ToolMessage, HumanMessage, AIMessage
 from react_agent.memory.context import Context
 from react_agent.tools import TOOLS
+
+try:
+    from langchain_openai.chat_models.base import _convert_message_to_dict
+except Exception:
+    _convert_message_to_dict = None
+
+
+def _ai_tool_call_ids(msg) -> List[str]:
+    """返回一条消息中 DeepSeek 实际会看到的所有 tool_call id —— 全项目统一检测口径。
+
+        设计要点：
+          1) 先读 .tool_calls 与 .invalid_tool_calls 两个属性（命中即返回，
+             避免对绝大多数“无工具调用”的普通消息做无谓的 dict 转换）。
+             .invalid_tool_calls 覆盖了“JSON 参数解析失败”这一最高频的悬空来源。
+          2) 两个属性都为空时，再用官方转换函数兜底，捕捉藏在流式 chunk /
+             additional_kwargs 里、属性读不到的隐藏调用。
+
+        返回：
+          - 非 AIMessage           -> []
+          - 无任何待应答 tool_call  -> []
+          - 否则                   -> 去重且保序的 id 列表
+        """
+    if not isinstance(msg, AIMessage):
+        return []
+
+    ids: List[str] = []
+    for tc in (getattr(msg, "tool_calls", None) or []):
+        _id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if _id and _id not in ids:
+            ids.append(_id)
+    for itc in (getattr(msg, "invalid_tool_calls", None) or []):
+        _id = itc.get("id") if isinstance(itc, dict) else getattr(itc, "id", None)
+        if _id and _id not in ids:
+            ids.append(_id)
+    if ids:
+        return ids
+
+    # 属性为空：用官方转换函数兜底，捕捉 chunk / additional_kwargs 中的隐藏调用
+    if _convert_message_to_dict is not None:
+        try:
+            d = _convert_message_to_dict(msg)
+            return [t.get("id") for t in (d.get("tool_calls") or []) if t.get("id")]
+        except Exception:
+            pass
+    return []
 
 
 def _get_active_tools(ctx: Context) -> tuple[list, frozenset[str]]:
@@ -65,29 +109,26 @@ def _extract_recent_tool_messages(messages: List[AnyMessage]) -> List[ToolMessag
 RememberedError = Optional[Dict[str, str]]
 
 
-def _parse_tool_payload(content: Any) -> Tuple[Optional[dict], RememberedError]:
-    """把 ToolMessage.content 尽量解析成 dict"""
-    if isinstance(content, dict):
-        return content, None
+# 后续需要修改！！！
+def find_last_real_human_idx(messages: list) -> int:
+    """从后往前找最后一条真实 HumanMessage 的索引，找不到返回 -1。"""
+    return next(
+        (i for i in range(len(messages) - 1, -1, -1)
+         if isinstance(messages[i], HumanMessage)
+         and getattr(messages[i], "name", None) not in {"system_monitor", "system_terminator"}),
+        -1
+    )
 
-    if isinstance(content, str):
-        text = content.strip()
 
-        if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
-            try:
-                obj = json.loads(text)
-                if isinstance(obj, dict):
-                    return obj, None
-                return {"data": obj}, None
-            except Exception as e:
-                return None, {
-                    "code": "TOOL_PAYLOAD_PARSE_FAILED",
-                    "message": f"JSON解析失败：{type(e).__name__}: {e}",
-                }
-
-        return {"data": text}, None
-
-    return {"data": content}, None
+def _count_rag_in_current_turn(messages: list) -> int:
+    last_human_idx = _find_last_real_human_idx(messages)
+    if last_human_idx < 0:
+        return 0
+    return sum(
+        1 for m in messages[last_human_idx:]
+        if isinstance(m, ToolMessage)
+        and getattr(m, "name", None) == "query_internal_knowledge"
+    )
 
 
 def _tc_name(tc: dict) -> str:

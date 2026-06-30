@@ -8,11 +8,15 @@ import hashlib
 import asyncio
 import pickle
 import threading
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from react_agent.utils.redis_client import get_sync_redis
 from react_agent.core.config import settings
+from react_agent.utils.embedder import get_embedder
 
+
+logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # 全局单例 & 锁
 # ──────────────────────────────────────────────
@@ -30,9 +34,27 @@ _BM25_DOCCOUNT_KEY = "rag:bm25_doc_count"
 _BM25_HMAC_KEY = "rag:bm25_hmac"
 
 # RISK-5 修复：将 BM25 检索数量提取为具名常量，避免与 RRF 的 k=60 混淆
-_BM25_TOP_K = 5
+_BM25_TOP_K = 10
 # RRF 融合常数，语义与循环变量完全隔离
 _RRF_K = 60
+
+# 行业关键词表
+_INDUSTRY_KEYWORDS = {
+    "半导体": ["半导体", "芯片", "存储", "AI算力", "光刻机"],
+    "房地产开发": ["房地产", "宅地", "楼面价", "住宅", "土拍"],
+    "能源金属": ["金属", "锂", "铜", "黄金", "钢铁", "锡", "稀土"],
+    "电力": ["电力", "风电", "光伏", "核电", "火电"],
+    "教育": ["教育", "学习", "早教行业", "AI教育", "在线教育", "升学", "课堂活动"],
+    "互联网电商": ["电商", "GMV", "跨境电商", "物流"]
+}
+
+
+def _detect_industry(q: str) -> str | None:
+    """从 query 中匹配行业，匹配不到返回 None（不过滤）。"""
+    for industry, keywords in _INDUSTRY_KEYWORDS.items():
+        if any(kw in q for kw in keywords):
+            return industry
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -76,7 +98,7 @@ def _load_bm25_from_redis():
     """
     secret = _get_hmac_secret()
     if secret is None:
-        print("[RAG] ⚠️ BM25_HMAC_SECRET 未配置，跳过 Redis 缓存（安全策略）")
+        logger.info("[RAG] ⚠️ BM25_HMAC_SECRET 未配置，跳过 Redis 缓存（安全策略）")
         return None
 
     try:
@@ -88,11 +110,11 @@ def _load_bm25_from_redis():
         # 验证签名，防止 Redis 被写入恶意 payload
         stored_sig = r.get(_BM25_HMAC_KEY)
         if not stored_sig:
-            print("[RAG] ⚠️ Redis 中缺少 BM25 签名，拒绝加载")
+            logger.info("[RAG] ⚠️ Redis 中缺少 BM25 签名，拒绝加载")
             return None
         sig_str = stored_sig.decode("utf-8") if isinstance(stored_sig, bytes) else stored_sig
         if not _verify_payload(data, sig_str):
-            print("[RAG] ⚠️ BM25 签名验证失败，数据可能被篡改，拒绝加载")
+            logger.info("[RAG] ⚠️ BM25 签名验证失败，数据可能被篡改，拒绝加载")
             return None
 
         retriever = pickle.loads(data)  # 签名已通过，反序列化安全
@@ -100,11 +122,11 @@ def _load_bm25_from_redis():
         # BUG-1 修复：r.get() 以 decode_responses=False 返回 bytes，需先 decode
         raw_count = r.get(_BM25_DOCCOUNT_KEY)
         doc_count = int(raw_count.decode("utf-8")) if raw_count else 0
-        print(f"[RAG] ✅ BM25 索引从 Redis 加载（文档数: {doc_count}）")
+        logger.info(f"[RAG] ✅ BM25 索引从 Redis 加载（文档数: {doc_count}）")
         return retriever
 
     except Exception as e:
-        print(f"[RAG] ⚠️ Redis 读取 BM25 失败: {e}，将重建索引")
+        logger.info(f"[RAG] ⚠️ Redis 读取 BM25 失败: {e}，将重建索引")
         return None
 
 
@@ -115,7 +137,7 @@ def _save_bm25_to_redis(retriever, doc_count: int) -> None:
     """
     secret = _get_hmac_secret()
     if secret is None:
-        print("[RAG] ⚠️ BM25_HMAC_SECRET 未配置，跳过 Redis 写入（安全策略）")
+        logger.info("[RAG] ⚠️ BM25_HMAC_SECRET 未配置，跳过 Redis 写入（安全策略）")
         return
 
     try:
@@ -132,9 +154,9 @@ def _save_bm25_to_redis(retriever, doc_count: int) -> None:
         pipe.set(_BM25_DOCCOUNT_KEY, str(doc_count), ex=ttl)
         pipe.set(_BM25_HMAC_KEY, signature, ex=ttl)
         pipe.execute()
-        print(f"[RAG] ✅ BM25 索引已缓存到 Redis（文档数: {doc_count}，TTL: {ttl}s）")
+        logger.info(f"[RAG] ✅ BM25 索引已缓存到 Redis（文档数: {doc_count}，TTL: {ttl}s）")
     except Exception as e:
-        print(f"[RAG] ⚠️ Redis 写入 BM25 失败: {e}，继续使用内存索引")
+        logger.info(f"[RAG] ⚠️ Redis 写入 BM25 失败: {e}，继续使用内存索引")
 
 
 # ──────────────────────────────────────────────
@@ -151,12 +173,12 @@ def invalidate_bm25_cache() -> None:
         try:
             r = get_sync_redis()
             r.delete(_BM25_CACHE_KEY, _BM25_DOCCOUNT_KEY, _BM25_HMAC_KEY)
-            print("[RAG] 🗑️ BM25 Redis 缓存已清除")
+            logger.info("[RAG] 🗑️ BM25 Redis 缓存已清除")
         except Exception as e:
-            print(f"[RAG] ⚠️ 清除 Redis 缓存失败: {e}")
+            logger.info(f"[RAG] ⚠️ 清除 Redis 缓存失败: {e}")
         # 无论 Redis 操作是否成功，内存单例必须重置
         _retriever_instance = None
-        print("[RAG] 🗑️ BM25 内存单例已重置，下次调用将重建索引")
+        logger.info("[RAG] 🗑️ BM25 内存单例已重置，下次调用将重建索引")
 
 
 # ──────────────────────────────────────────────
@@ -180,10 +202,6 @@ def _get_retriever() -> dict:
         except ImportError:
             raise ImportError("缺少依赖：pip install langchain-chroma")
         try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-        except ImportError:
-            raise ImportError("缺少依赖：pip install langchain-huggingface sentence-transformers")
-        try:
             from langchain_community.retrievers import BM25Retriever
         except ImportError:
             raise ImportError("缺少依赖：pip install rank_bm25 langchain-community")
@@ -192,9 +210,8 @@ def _get_retriever() -> dict:
         # STYLE-2 TODO：将下方两行迁移至 settings.chroma.db_path / settings.embedding.model_name，
         #               统一配置管理入口，消除与 settings.redis.* 的风格不一致。
         chroma_dir = os.getenv("CHROMA_DB_PATH") or str(settings.tools.vector_store.CHROMA_DB_PATH)
-        model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
-        embeddings = HuggingFaceEmbeddings(model_name=model_name)
+        embeddings = get_embedder()
         vectorstore = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
         vector_retriever = vectorstore.as_retriever(search_kwargs={"k": _BM25_TOP_K})
 
@@ -208,7 +225,7 @@ def _get_retriever() -> dict:
             # Redis 无缓存，从向量库全量重建
             all_docs = vectorstore.get(include=["documents", "metadatas"])
             if not all_docs or not all_docs.get("documents"):
-                print("[RAG] ⚠️ 知识库为空，本次降级为纯向量检索")
+                logger.info("[RAG] ⚠️ 知识库为空，本次降级为纯向量检索")
                 # BUG-4 修复：不写入 _retriever_instance，
                 #            允许知识库写入后下次调用自动恢复 BM25
                 return {"bm25": None, "vector": vector_retriever}
@@ -219,12 +236,16 @@ def _get_retriever() -> dict:
             ]
             bm25_retriever = BM25Retriever.from_documents(docs_for_bm25)
             bm25_retriever.k = _BM25_TOP_K
-            print(f"[RAG] ✅ BM25 索引重建完成（文档数: {len(docs_for_bm25)}）")
+            logger.info(f"[RAG] ✅ BM25 索引重建完成（文档数: {len(docs_for_bm25)}）")
 
             # RISK-4 修复：提交给独立线程池，锁在此之后立即释放，不等待 Redis 写入完成
             _redis_save_executor.submit(_save_bm25_to_redis, bm25_retriever, len(docs_for_bm25))
 
-        _retriever_instance = {"bm25": bm25_retriever, "vector": vector_retriever}
+        _retriever_instance = {
+            "bm25": bm25_retriever,
+            "vector": vector_retriever,
+            "vectorstore": vectorstore,  # ← 把已有的对象也缓存进去
+        }
         return _retriever_instance
 
 
@@ -236,6 +257,44 @@ async def _dual_retrieve(q: str) -> list:
 
     bm25 = retriever.get("bm25")
     vector = retriever.get("vector")
+    # vectorstore = retriever.get("vectorstore")  # ← 取出
+    #
+    # # 判断是否命中行业
+    # industry = _detect_industry(q)
+    #
+    # if industry and vectorstore:
+    #     vector_task = asyncio.to_thread(
+    #         vectorstore.similarity_search, q, k=_BM25_TOP_K,
+    #         filter={"industry": industry},
+    #     )
+    # else:
+    #     vector_task = asyncio.to_thread(vector.invoke, q)
+    #
+    # if bm25 is not None:
+    #     bm25_docs, vector_docs = await asyncio.gather(
+    #         asyncio.to_thread(bm25.invoke, q),
+    #         vector_task,
+    #     )
+    # else:
+    #     vector_docs = await vector_task
+    #     bm25_docs = []
+    #
+    # rrf_scores: dict[str, float] = {}
+    # doc_map:    dict[str, object] = {}
+    #
+    # def get_key(doc) -> str:
+    #     # RISK-3 修复：用 None 显式检查，避免 chunk_id="" 被 falsy 判断误判
+    #     # RISK-2 注：若知识库存在前100字相同的不同文档，应在 ingest 阶段确保 chunk_id 唯一
+    #     cid = doc.metadata.get("chunk_id")
+    #
+    #     # 如果chunk_id因异常情况被赋值为""，即chunk_id为空字符串时依旧是True，避免RISK-2
+    #     return cid if cid is not None else doc.page_content[:100]
+    #
+    # if industry:
+    #     bm25_docs = sorted(
+    #         bm25_docs,
+    #         key=lambda d: 0 if d.metadata.get("industry") == industry else 1,
+    #     )
 
     if bm25 is not None:
         bm25_docs, vector_docs = await asyncio.gather(
@@ -257,7 +316,6 @@ async def _dual_retrieve(q: str) -> list:
         # 如果chunk_id因异常情况被赋值为""，即chunk_id为空字符串时依旧是True，避免RISK-2
         return cid if cid is not None else doc.page_content[:100]
 
-
     for rank, doc in enumerate(bm25_docs):
         key = get_key(doc)
         # RISK-5 修复：RRF 常数改名为 _RRF_K，循环变量使用 key，语义完全隔离
@@ -270,4 +328,4 @@ async def _dual_retrieve(q: str) -> list:
         doc_map[key] = doc
 
     sorted_keys = sorted(rrf_scores, key=lambda key: rrf_scores[key], reverse=True)
-    return [doc_map[key] for key in sorted_keys[:10]]
+    return [doc_map[key] for key in sorted_keys[:2*_BM25_TOP_K]]

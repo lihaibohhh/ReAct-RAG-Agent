@@ -32,6 +32,20 @@ RAG 评测脚本 — src/eval/run_eval.py
       _rerank 阈值过滤后若结果为空，降级返回 _dual_retrieve 的 RRF 原始排序 top_n 条
       此前若 _rerank 返回空列表，contexts 全空导致 RAGAS 无法计算任何指标
   - 新增 --debug_retrieval 参数：对前 3 条记录打印详细检索中间结果，用于诊断
+
+【修复记录 v3】
+  - 修复 _MarkdownStrippingLLM：改为继承 BaseChatModel，重写 _generate/_agenerate
+    原 Wrapper 因 __getattr__ 透传，RAGAS 绕过所有公开方法直接调 _generate，
+    导致剥离逻辑从未执行。继承方案从架构上占据最底层，无法被绕过。
+  - 补充缺失的 ChatResult 导入
+
+【修复记录 v4】
+  - 修复 ContextPrecision NaN=71% 问题：
+    根因：RAGAS AP@K 公式在所有 contexts 均被判为 irrelevant 时分母为 0 → NaN
+    现象：contexts_count=5 时 NaN 率高达 89%，contexts_count=1-2 时为 0%
+    修复1：NaN Precision 语义上等于 "无 context 有用" → 记为 0.0 而非排除
+    修复2：fallback 时限制为 min(3, top_n) 条，避免低质量文档全部被判 irrelevant
+    修复3：默认 --top_n 从 5 改为 3（与线上 _rerank 默认值一致，减少噪声 context）
 """
 
 from __future__ import annotations
@@ -48,8 +62,13 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+from pydantic import PrivateAttr
+from langchain_core.language_models import BaseChatModel
+from langchain_core.outputs import ChatResult
 
+
+logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 路径修复：确保从 src/ 下任何位置运行都能找到 react_agent 包
 # ---------------------------------------------------------------------------
@@ -83,58 +102,71 @@ try:
     _RAGAS_OK = True
 except ImportError:
     _RAGAS_OK = False
-    logging.warning("ragas 或 datasets 未安装，将跳过 RAGAS 打分。pip install ragas datasets")
+    logger.warning("ragas 或 datasets 未安装，将跳过 RAGAS 打分。pip install ragas datasets")
 
 # ---------------------------------------------------------------------------
 # DeepSeek Markdown 剥离包装器
 # ---------------------------------------------------------------------------
 
 
-class _MarkdownStrippingLLM:
+class _MarkdownStrippingLLM(BaseChatModel):
     """
-    DeepSeek 等模型有时会在 JSON 响应外面包裹 ```json ... ``` 代码块，
-    而 RAGAS 的 Pydantic 解析器期望裸 JSON，导致 ValidationError。
-
-    此包装器在 LLM 和 RAGAS 之间拦截所有响应，自动剥离 Markdown 代码围栏，
-    其余行为与原始 LLM 完全一致（透传 invoke / ainvoke / bind 等方法）。
-
-    用法：
-        llm = load_chat_model("deepseek/deepseek-chat")
-        wrapped = _MarkdownStrippingLLM(llm)
-        LangchainLLMWrapper(wrapped)
+    继承 BaseChatModel，在最底层的 _generate / _agenerate 剥离 Markdown 围栏。
     """
 
-    # Markdown 代码围栏正则：匹配 ```json ... ``` 或 ``` ... ```
-    _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+    # ClassVar：整个类只编译一次，不随实例重复创建
+    _FENCE_RE: ClassVar[re.Pattern] = re.compile(
+        r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL
+    )
 
-    def __init__(self, llm: Any) -> None:
+    _llm: Any = PrivateAttr()
+
+    def __init__(self, llm: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._llm = llm
 
     def _strip(self, content: str) -> str:
-        m = self._FENCE_RE.match(content.strip())
-        return m.group(1).strip() if m else content
+        content = content.strip()
 
-    def invoke(self, *args: Any, **kwargs: Any) -> Any:
-        from langchain_core.messages import AIMessage
-        resp = self._llm.invoke(*args, **kwargs)
-        if hasattr(resp, "content") and isinstance(resp.content, str):
-            resp = AIMessage(content=self._strip(resp.content))
-        return resp
+        m = self._FENCE_RE.match(content)
+        if m:
+            return m.group(1).strip()
 
-    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
-        from langchain_core.messages import AIMessage
-        resp = await self._llm.ainvoke(*args, **kwargs)
-        if hasattr(resp, "content") and isinstance(resp.content, str):
-            resp = AIMessage(content=self._strip(resp.content))
-        return resp
+        try:
+            json.loads(content)
+            return content
+        except json.JSONDecodeError:
+            pass
 
-    # RAGAS 内部有时会调用 .bind() 传额外参数，透传给底层 LLM
-    def bind(self, **kwargs: Any) -> "_MarkdownStrippingLLM":
-        return _MarkdownStrippingLLM(self._llm.bind(**kwargs))
+        m2 = re.search(r'\{.*\}', content, re.DOTALL)
+        if m2:
+            candidate = m2.group(0).strip()
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                logger.warning(f"[MarkdownStrip] 提取的片段不是合法 JSON: {candidate[:120]}")
 
-    # 透传其他属性（如 model_name、temperature 等），保持鸭子类型兼容
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._llm, name)
+        logger.warning(f"[MarkdownStrip] 无法提取有效 JSON，原样透传: {content[:80]}")
+        return content
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        result = self._llm._generate(messages, stop=stop, **kwargs)
+        for gen in result.generations:
+            if isinstance(gen.message.content, str):
+                gen.message.content = self._strip(gen.message.content)
+        return result
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        result = await self._llm._agenerate(messages, stop=stop, **kwargs)
+        for gen in result.generations:
+            if isinstance(gen.message.content, str):
+                gen.message.content = self._strip(gen.message.content)
+        return result
+
+    @property
+    def _llm_type(self) -> str:
+        return "markdown_stripping_wrapper"
 
 
 # ---------------------------------------------------------------------------
@@ -210,18 +242,18 @@ def load_dataset(path: str) -> list[dict]:
 
             records.append(obj)
 
-    logging.info(f"加载完成：有效 {len(records)} 条，过滤噪声 {noise_count} 条")
+    logger.info(f"加载完成：有效 {len(records)} 条，过滤噪声 {noise_count} 条")
     return records
 
 
 def sample_dataset(records: list[dict], n: int, seed: int = 42) -> list[dict]:
     """随机采样 n 条，n <= 总数时直接使用全部。"""
     if n >= len(records):
-        logging.info(f"采样数 {n} >= 总量 {len(records)}，使用全部")
+        logger.info(f"采样数 {n} >= 总量 {len(records)}，使用全部")
         return records
     random.seed(seed)
     sampled = random.sample(records, n)
-    logging.info(f"已采样 {len(sampled)} / {len(records)} 条")
+    logger.info(f"已采样 {len(sampled)} / {len(records)} 条")
     return sampled
 
 
@@ -246,27 +278,29 @@ async def retrieve_for_one(record: dict, top_n: int, debug: bool = False) -> dic
         raw_docs = await _dual_retrieve(question)
 
         if debug:
-            logging.info(
+            logger.info(
                 f"[DEBUG] 问题: {question[:40]}...\n"
                 f"  _dual_retrieve 返回 {len(raw_docs)} 条，"
                 f"前3条预览: {[d.page_content[:50] for d in raw_docs[:3]]}"
             )
 
         # Step 2：Cross-Encoder 精排
-        reranked = await _rerank(question, raw_docs, top_n=top_n)
+        reranked, score = await _rerank(question, raw_docs, top_n=top_n)
 
         if debug:
-            logging.info(
+            logger.info(
                 f"  _rerank 返回 {len(reranked)} 条"
                 + (f"，前3条预览: {[d.page_content[:50] for d in reranked[:3]]}" if reranked else "（空！触发降级）")
             )
 
-        # 【v2 修复】_rerank 返回空时降级保底：使用 RRF 原始排序 top_n 条
-        # 原因：评测集的 chunk 若为乱码表格片段，Cross-Encoder 得分会全部低于阈值
-        # 降级后 contexts 不为空，RAGAS 才能正常计算指标
+        # 【v4 修复】fallback 条数限制为 min(3, top_n)
+        # 原因：raw_docs 中低质量文档（未通过 Reranker 阈值）若全量传入 RAGAS，
+        # LLM 会将所有 context 判为 irrelevant → AP@K 分母为 0 → NaN
+        # 限制为 3 条可保留最高 RRF 分的文档，降低全判 irrelevant 的概率
         if not reranked and raw_docs:
-            logging.debug(f"Reranker 返回空，降级使用 RRF Top-{top_n}：[{question[:30]}...]")
-            reranked = raw_docs[:top_n]
+            fallback_n = min(3, top_n)
+            logger.debug(f"Reranker 返回空，降级使用 RRF Top-{fallback_n}：[{question[:30]}...]")
+            reranked = raw_docs[:fallback_n]
 
         # Step 3：提取 contexts 和 sources
         contexts: list[str] = []
@@ -286,7 +320,7 @@ async def retrieve_for_one(record: dict, top_n: int, debug: bool = False) -> dic
         return {**record, "contexts": contexts, "sources": sources, "retrieve_ok": True}
 
     except Exception as e:
-        logging.warning(f"检索失败 [{question[:30]}...]: {e}", exc_info=True)
+        logger.warning(f"检索失败 [{question[:30]}...]: {e}", exc_info=True)
         return {**record, "contexts": [], "sources": [], "retrieve_ok": False}
 
 
@@ -312,7 +346,7 @@ async def batch_retrieve(
             )
         done_count += 1
         if done_count % 10 == 0 or done_count == len(records):
-            logging.info(f"  检索进度：{done_count}/{len(records)}")
+            logger.info(f"  检索进度：{done_count}/{len(records)}")
 
     await asyncio.gather(*(bounded_retrieve(i, rec) for i, rec in enumerate(records)))
     return [r for r in results if r is not None]
@@ -341,11 +375,11 @@ def _generate_answers_sync(records: list[dict], llm: Any) -> list[dict]:
             response = llm.invoke(prompt)
             answer = response.content if hasattr(response, "content") else str(response)
         except Exception as e:
-            logging.warning(f"LLM 生成失败 [{question[:30]}...]: {e}")
+            logger.warning(f"LLM 生成失败 [{question[:30]}...]: {e}")
             answer = ""
         updated.append({**rec, "answer": answer})
         if i % 10 == 0 or i == len(records):
-            logging.info(f"  生成进度：{i}/{len(records)}")
+            logger.info(f"  生成进度：{i}/{len(records)}")
     return updated
 
 
@@ -367,7 +401,7 @@ def _run_ragas_sync(records: list[dict], llm: Any, retrieval_only: bool) -> list
       ground_truth -> reference
     """
     if not _RAGAS_OK:
-        logging.warning("RAGAS 不可用，跳过打分，所有指标填 None")
+        logger.warning("RAGAS 不可用，跳过打分，所有指标填 None")
         return [
             {**r, "context_precision": None, "context_recall": None, "faithfulness": None}
             for r in records
@@ -385,7 +419,7 @@ def _run_ragas_sync(records: list[dict], llm: Any, retrieval_only: bool) -> list
     # 统计 contexts 为空的比例，方便排查检索问题
     empty_ctx = sum(1 for c in data["retrieved_contexts"] if not c)
     if empty_ctx > 0:
-        logging.warning(
+        logger.warning(
             f"⚠️  {empty_ctx}/{len(records)} 条记录的 retrieved_contexts 为空，"
             f"这些条目的 Precision/Recall 将计为 0。"
             f"建议先用 --debug_retrieval 排查检索问题。"
@@ -405,19 +439,39 @@ def _run_ragas_sync(records: list[dict], llm: Any, retrieval_only: bool) -> list
     if not retrieval_only:
         metrics.append(Faithfulness(llm=wrapped_llm))
 
-    logging.info(f"RAGAS 打分中（{len(records)} 条，指标：{[m.name for m in metrics]}）...")
+    logger.info(f"RAGAS 打分中（{len(records)} 条，指标：{[m.name for m in metrics]}）...")
     result = ragas_evaluate(hf_dataset, metrics=metrics)
     df = result.to_pandas()
 
     enriched = []
+    nan_precision_count = 0
     for i, rec in enumerate(records):
         row = df.iloc[i]
+
+        # 【v4 修复】ContextPrecision NaN 的语义：所有 contexts 均被 LLM 判为 irrelevant
+        # RAGAS 的 AP@K 公式此时分母为 0，返回 NaN。
+        # 语义上这等价于 precision=0（没有任何有用的 context），而非"无法计算"，
+        # 因此记为 0.0 而非 None，使其参与均值统计，避免高估整体 Precision。
+        cp_raw = _safe_float(row.get("context_precision"))
+        if cp_raw is None:
+            cp = 0.0
+            nan_precision_count += 1
+        else:
+            cp = cp_raw
+
         enriched.append({
             **rec,
-            "context_precision": _safe_float(row.get("context_precision")),
+            "context_precision": cp,
             "context_recall":    _safe_float(row.get("context_recall")),
             "faithfulness":      _safe_float(row.get("faithfulness")) if not retrieval_only else None,
         })
+
+    if nan_precision_count > 0:
+        logger.warning(
+            f"⚠️  {nan_precision_count}/{len(records)} 条 ContextPrecision 原始值为 NaN "
+            f"（所有 contexts 均被判为 irrelevant，AP@K 分母=0），已记为 0.0。"
+            f"若占比过高（>30%），建议提高 Reranker 阈值或减小 --top_n。"
+        )
     return enriched
 
 
@@ -463,7 +517,7 @@ def compute_summary(records: list[dict]) -> dict:
 
     for ind, group in industry_groups.items():
         if len(group) < 3:
-            logging.debug(f"行业 [{ind}] 样本 {len(group)} 条，不足 3 条跳过")
+            logger.debug(f"行业 [{ind}] 样本 {len(group)} 条，不足 3 条跳过")
             continue
         summary["by_industry"][ind] = metrics_of(group)
 
@@ -509,13 +563,13 @@ def print_console_report(summary: dict) -> None:
     g = summary["global"]
     sep = "─" * 56
 
-    print(f"\n{'=' * 56}")
-    print(f"  RAG 评测报告  |  {summary['generated_at']}")
-    print(f"{'=' * 56}")
-    print(f"  总样本数：{summary['total_samples']}")
-    print(sep)
-    print(f"  {'指标':<22} {'均值':>8}")
-    print(sep)
+    logger.info(f"\n{'=' * 56}")
+    logger.info(f"  RAG 评测报告  |  {summary['generated_at']}")
+    logger.info(f"{'=' * 56}")
+    logger.info(f"  总样本数：{summary['total_samples']}")
+    logger.info(sep)
+    logger.info(f"  {'指标':<22} {'均值':>8}")
+    logger.info(sep)
     for key, label in [
         ("context_precision", "Context Precision"),
         ("context_recall",    "Context Recall"),
@@ -523,57 +577,57 @@ def print_console_report(summary: dict) -> None:
     ]:
         val = g[key]
         display = f"{val:.4f}" if val is not None else "  N/A "
-        print(f"  {label:<22} {display:>8}")
-    print(sep)
+        logger.info(f"  {label:<22} {display:>8}")
+    logger.info(sep)
 
     if summary["by_industry"]:
-        print(f"\n  分行业统计（样本 >= 3）")
-        print(sep)
-        print(f"  {'行业':<14} {'Precision':>10} {'Recall':>10} {'Faithful':>10} {'n':>4}")
-        print(sep)
+        logger.info(f"\n  分行业统计（样本 >= 3）")
+        logger.info(sep)
+        logger.info(f"  {'行业':<14} {'Precision':>10} {'Recall':>10} {'Faithful':>10} {'n':>4}")
+        logger.info(sep)
         for ind, m in sorted(summary["by_industry"].items()):
-            p  = f"{m['context_precision']:.3f}" if m["context_precision"] is not None else " N/A"
-            r  = f"{m['context_recall']:.3f}"    if m["context_recall"]    is not None else " N/A"
-            fa = f"{m['faithfulness']:.3f}"      if m["faithfulness"]      is not None else " N/A"
-            print(f"  {ind:<14} {p:>10} {r:>10} {fa:>10} {m['n']:>4}")
-        print(sep)
+            p = f"{m['context_precision']:.3f}" if m["context_precision"] is not None else " N/A"
+            r = f"{m['context_recall']:.3f}" if m["context_recall"] is not None else " N/A"
+            fa = f"{m['faithfulness']:.3f}" if m["faithfulness"] is not None else " N/A"
+            logger.info(f"  {ind:<14} {p:>10} {r:>10} {fa:>10} {m['n']:>4}")
+        logger.info(sep)
 
-    print("\n  自动诊断建议")
-    print(sep)
-    prec  = g["context_precision"]
-    rec   = g["context_recall"]
+    logger.info("\n  自动诊断建议")
+    logger.info(sep)
+    prec = g["context_precision"]
+    rec = g["context_recall"]
     faith = g["faithfulness"]
     has_suggestion = False
 
     if rec is not None and rec < 0.5:
-        print("  Recall 偏低 -> 建议扩大 top_n（当前可调 --top_n 参数）")
-        print("       或检查 chunk_size 是否过小导致关键段落碎片化")
+        logger.info("  Recall 偏低 -> 建议扩大 top_n（当前可调 --top_n 参数）")
+        logger.info("       或检查 chunk_size 是否过小导致关键段落碎片化")
         has_suggestion = True
     if prec is not None and prec < 0.5:
-        print("  Precision 偏低 -> 召回噪声多，可提高 Reranker 阈值")
-        print("       (RERANKER_THRESHOLD 当前建议 -5，可适当上调至 -3)")
+        logger.info("  Precision 偏低 -> 召回噪声多，可提高 Reranker 阈值")
+        logger.info("       (RERANKER_THRESHOLD 当前建议 -5，可适当上调至 -3)")
+        logger.info("       或减小 --top_n（当前默认 3），减少低质量 context 干扰")
         has_suggestion = True
     if faith is not None and faith < 0.6:
-        print("  Faithfulness 偏低 -> 答案幻觉风险高，建议检查 system prompt")
-        print("       或缩短 context 截断长度，减少低质量片段干扰")
+        logger.info("  Faithfulness 偏低 -> 答案幻觉风险高，建议检查 system prompt")
+        logger.info("       或缩短 context 截断长度，减少低质量片段干扰")
         has_suggestion = True
     if not has_suggestion:
-        print("  各项指标正常，无明显异常。")
+        logger.info("  各项指标正常，无明显异常。")
 
-    print(f"{'=' * 56}\n")
+    logger.info(f"{'=' * 56}\n")
 
 
 # ---------------------------------------------------------------------------
 # 主入口（async）
 # ---------------------------------------------------------------------------
-
 async def main() -> None:
     parser = argparse.ArgumentParser(description="RAG 系统自动评测工具")
     parser.add_argument(
         "--dataset", default=r"E:\transformer_program\nanoGPT_program\AI_Agent\agent_v0\react-agent-main\src\eval\dataset\eval_dataset.jsonl",
         help=".jsonl 评测数据集路径",
     )
-    parser.add_argument("--n",    type=int, default=50,  help="随机采样条数（默认 50）")
+    parser.add_argument("--n",    type=int, default=150,  help="随机采样条数（默认 50）")
     parser.add_argument(
         "--top_n", type=int, default=3,
         help="Reranker 返回 Top-N 文档数（默认 3，与线上 _rerank 默认值一致）",
@@ -582,12 +636,12 @@ async def main() -> None:
         help="只测检索质量，跳过 LLM 生成与 Faithfulness")
     parser.add_argument("--concurrency", type=int, default=8,
         help="并发检索协程数（默认 8）")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=42,  # 42
         help="随机种子，保证采样可复现（默认 42）")
     parser.add_argument(
         "--model", default='deepseek/deepseek-chat',
         help=(
-            "LLM 模型引用，格式 provider/model_name（如 deepseek/deepseek-chat）。"
+            "LLM 模型引用，格式 provider/model_name（如 deepseek/deepseek-v4-flash）。"
             "不传时自动从 config.yaml 读取 model_ref 或 model 键。"
         ),
     )
@@ -597,64 +651,63 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     # -- 0. 确定模型引用 -------------------------------------------------------
     model_ref = args.model or _read_model_ref_from_config()
     if not model_ref:
-        logging.error(
+        logger.error(
             "未找到模型配置。请在 config.yaml 中设置 model_ref 键，"
             "或通过 --model provider/model_name 参数传入。"
         )
         sys.exit(1)
-    logging.info(f"使用模型：{model_ref}")
+    logger.info(f"使用模型：{model_ref}")
     llm = load_chat_model(model_ref)   # @lru_cache，多次调用不会重复初始化
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     t_start = time.time()
 
     # -- 1. 加载数据 -----------------------------------------------------------
-    logging.info(f"加载数据集：{args.dataset}")
+    logger.info(f"加载数据集：{args.dataset}")
     records = load_dataset(args.dataset)
     if not records:
-        logging.error("数据集为空，退出")
+        logger.error("数据集为空，退出")
         sys.exit(1)
     records = sample_dataset(records, args.n, seed=args.seed)
 
     # -- 2. 批量检索（async，Semaphore 控并发）---------------------------------
-    logging.info(f"开始批量检索（top_n={args.top_n}，concurrency={args.concurrency}）...")
+    logger.info(f"开始批量检索（top_n={args.top_n}，concurrency={args.concurrency}）...")
     debug_n = 3 if args.debug_retrieval else 0
     records = await batch_retrieve(
         records, top_n=args.top_n, concurrency=args.concurrency, debug_first_n=debug_n
     )
-    retrieved_ok  = sum(1 for r in records if r.get("retrieve_ok"))
-    contexts_ok   = sum(1 for r in records if r.get("contexts"))
-    logging.info(f"检索完成：{retrieved_ok}/{len(records)} 条无异常，{contexts_ok}/{len(records)} 条有 contexts")
+    retrieved_ok = sum(1 for r in records if r.get("retrieve_ok"))
+    contexts_ok = sum(1 for r in records if r.get("contexts"))
+    logger.info(f"检索完成：{retrieved_ok}/{len(records)} 条无异常，{contexts_ok}/{len(records)} 条有 contexts")
 
     # -- 3. LLM 生成答案（端到端模式，sync 函数通过 to_thread 调用）-----------
     if not args.retrieval_only:
-        logging.info("生成答案（端到端模式）...")
+        logger.info("生成答案（端到端模式）...")
         records = await asyncio.to_thread(_generate_answers_sync, records, llm)
 
     # -- 4. RAGAS 打分（sync 函数通过 to_thread 调用）--------------------------
-    logging.info("RAGAS 打分...")
+    logger.info("RAGAS 打分...")
     records = await asyncio.to_thread(_run_ragas_sync, records, llm, args.retrieval_only)
 
     # -- 5. 报告输出 -----------------------------------------------------------
     summary = compute_summary(records)
     json_path = write_json_summary(summary, timestamp)
-    csv_path  = write_csv_detail(records, timestamp)
+    csv_path = write_csv_detail(records, timestamp)
     print_console_report(summary)
 
     elapsed = time.time() - t_start
-    logging.info(f"评测完成，耗时 {elapsed:.1f}s")
-    logging.info(f"   摘要报告：{json_path}")
-    logging.info(f"   明细报告：{csv_path}")
+    logger.info(f"评测完成，耗时 {elapsed:.1f}s")
+    logger.info(f"   摘要报告：{json_path}")
+    logger.info(f"   明细报告：{csv_path}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     asyncio.run(main())

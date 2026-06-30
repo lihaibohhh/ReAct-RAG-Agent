@@ -122,12 +122,18 @@ class State(InputState):
     step_counter: int = 0
     """你自己的步数计数（可选）。"""
 
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cached_tokens: int = 0
+    cache_hit_tokens:   int = 0
+    cache_miss_tokens:  int = 0
+    completion_tokens:  int = 0
+    reasoning_tokens:   int = 0
+    prompt_tokens:      float = 0.0
+    total_tokens:       int = 0
     estimated_cost_usd: float = 0.0
-    llm_call_count: int = 0
+    llm_call_count:     int = 0
+
+    pending_directive: Optional[str] = None
+    """瞬态系统控制指令（如反思提示）。reflection_node 写入，call_model 读取后作为 SystemMessage
+    拼入当次模型输入并随即清空；不进入 messages 历史，避免过期提示堆积。"""
 
     # 在现有字段后面添加
 

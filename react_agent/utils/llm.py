@@ -152,7 +152,7 @@ def _build_deepseek_openai_compatible(model_name: str, s: ChatModelSettings) -> 
 
     base_url = _get_secret(
         "DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL",
-        "例如：DEEPSEEK_BASE_URL=https://api.deepseek.com/v1"
+        "例如：DEEPSEEK_BASE_URL=https://api.deepseek.com"
     )
     api_key = _get_secret(
         "DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY",

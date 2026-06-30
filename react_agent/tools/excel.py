@@ -119,7 +119,7 @@ async def _make_excel_impl(
         )
 
     # ════════════════════ 阶段 4：输出目录准备 ════════════════════
-    out_dir = os.getenv("EXCEL_OUTPUT_DIR", "./outputs")
+    out_dir = os.getenv("OUTPUT_DIR", "./outputs")
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,8 +250,25 @@ make_excel_table = StructuredTool.from_function(
     coroutine=_make_excel_impl,   # 异步函数用 coroutine= 参数
     name="make_excel_table",
     description=(
-        "用于将结构化数据（如对比表格、数据统计等）导出并保存为本地 Excel 文件。"
-        "支持新建、覆盖和追加模式。具体字段请严格参照 schema 要求传入。"
+        "【触发条件】以下情况调用本工具，将结构化数据保存为 Excel 文件：\n"
+        "  - 用户要求导出、下载、保存表格数据\n"
+        "  - 需要对比多公司/多指标数据，且数据条数 ≥ 3 行\n"
+        "  - 用户明确说'生成Excel'、'整理成表格'、'保存数据'\n"
+        "  示例场景：'把这5家公司的毛利率对比保存成Excel'\n\n"
+        "【不触发条件】以下情况不调用本工具：\n"
+        "  - 用户只需要在对话中看表格，未要求保存文件\n"
+        "  - 数据仅有1-2行，直接回答即可\n\n"
+        "【mode 选择逻辑】\n"
+        "  timestamp（默认）— 每次新建带时间戳的文件，不覆盖历史，推荐首次使用\n"
+        "  append           — 向已有同名文件追加数据，要求表头完全一致\n"
+        "  overwrite        — 覆盖已有文件，数据会丢失，需用户明确要求时才用\n\n"
+        "【输入关键字段】\n"
+        "  filename  — 不带后缀的文件名，如 'byd_analysis'\n"
+        "  headers   — 列名列表，如 ['公司', '毛利率', '报告期']\n"
+        "  rows      — 数据行列表，每行与 headers 等长\n\n"
+        "【输出关键字段】\n"
+        "  data.path      — 实际保存的文件路径（含时间戳），告知用户此路径\n"
+        "  data.row_count — 写入的数据行数（不含表头）"
     ),
     args_schema=ExcelInput,
 )

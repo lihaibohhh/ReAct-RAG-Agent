@@ -24,6 +24,7 @@ from typing import List, Tuple
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from react_agent.core.config import settings
 
 # ──────────────────────────────────────────────
 # 内部常量
@@ -32,6 +33,7 @@ _HEADER_FOOTER_RATIO = 0.07   # 页面顶部 / 底部各 7% 视为页眉页脚
 _COL_GAP_RATIO = 0.12   # 双栏之间空白带宽度阈值（相对页宽）
 _TABLE_OVERLAP_THRESH = 0.4   # 文字块与表格区域 IoU 超过此值则视为表格内文字
 _MIN_BLOCK_CHARS = 3      # 过滤掉字符数极少的噪声块（如单个页码）
+_COORD_TOLERANCE = 2.0   # 允许的浮点舍入误差（单位：pt）
 
 
 # ──────────────────────────────────────────────
@@ -239,7 +241,16 @@ def load_pdf_with_layout(
           source, page, chunk_id, doc_type ("text" | "table")
     """
     has_fitz, has_pdfplumber = _check_deps()
-    filename = Path(file_path).name
+    data_dir = settings.tools.vector_store.data_dir
+    try:
+        filename = str(Path(file_path).relative_to(data_dir))
+    except ValueError:
+        filename = Path(file_path).name
+
+    try:
+        industry = Path(file_path).relative_to(data_dir).parts[0]
+    except (ValueError, IndexError):
+        industry = None
 
     # ── 降级：两者均缺 ──────────────────────────────────────────
     if not has_fitz:
@@ -284,10 +295,10 @@ def load_pdf_with_layout(
                 RuntimeWarning,
                 stacklevel=2,
             )
-            plumber_ctx = None  # 降级：后续逻辑自动跳过表格
 
     try:
         for page_num in range(len(fitz_doc)):
+            human_page_num = page_num + 1
             fitz_page = fitz_doc[page_num]
             page_w = fitz_page.rect.width
             page_h = fitz_page.rect.height
@@ -297,26 +308,36 @@ def load_pdf_with_layout(
             if plumber_ctx is not None:
                 try:
                     plumber_page = plumber_ctx.pages[page_num]
-                    table_bboxes = _get_table_bboxes(plumber_page)
+                    plumber_h = plumber_page.height
+
+                    if abs(plumber_h - page_h) > _COORD_TOLERANCE:
+                        warnings.warn(
+                            f"⚠️  [pdf_parser] '{filename}' 第 {human_page_num} 页坐标系不一致 "
+                            f"(fitz={page_h:.1f}, plumber={plumber_h:.1f})，跳过表格区域剔除。",
+                            RuntimeWarning, stacklevel=2,
+                        )
+                    else:
+                        table_bboxes = _get_table_bboxes(plumber_page)
 
                     for t_idx, raw_table in enumerate(plumber_page.extract_tables() or []):
                         md = _table_to_markdown(raw_table)
                         if not md.strip():
                             continue
-                        chunk_id = f"{filename}::page_{page_num}::table_{t_idx}"
+                        chunk_id = f"{filename}::page_{human_page_num}::table_{t_idx}"
                         all_docs.append(Document(
                             page_content=md,
                             metadata={
                                 "source":   file_path,
-                                "page":     page_num,
+                                "page":     human_page_num,
                                 "chunk_id": chunk_id,
                                 "doc_type": "table",
+                                **({"industry": industry} if industry else {}),  # ← None 时不写入该字段
                             },
                         ))
                 except Exception as e:
                     # 当前页表格提取失败，降级：清空 bbox，PyMuPDF 正文提取不受影响
                     warnings.warn(
-                        f"⚠️  [pdf_parser] '{filename}' 第 {page_num} 页表格提取失败，"
+                        f"⚠️  [pdf_parser] '{filename}' 第 {human_page_num} 页表格提取失败，"
                         f"跳过本页表格（正文仍正常处理）：{e}",
                         RuntimeWarning,
                         stacklevel=2,
@@ -343,14 +364,15 @@ def load_pdf_with_layout(
                 chunk_text = chunk_text.strip()
                 if not chunk_text:
                     continue
-                chunk_id = f"{filename}::page_{page_num}::chunk_{c_idx}"
+                chunk_id = f"{filename}::page_{human_page_num}::chunk_{c_idx}"
                 all_docs.append(Document(
                     page_content=chunk_text,
                     metadata={
                         "source":   file_path,
-                        "page":     page_num,
+                        "page":     human_page_num,
                         "chunk_id": chunk_id,
                         "doc_type": "text",
+                        **({"industry": industry} if industry else {}),  # ← None 时不写入该字段
                     },
                 ))
 
@@ -367,3 +389,5 @@ def load_pdf_with_layout(
         )
 
     return all_docs
+
+

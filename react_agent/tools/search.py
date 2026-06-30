@@ -1,12 +1,16 @@
 from __future__ import annotations
 import os
+import time
 import asyncio
+import logging
 from typing import Any
 from langgraph.runtime import get_runtime
 from langchain_core.tools import tool
 from react_agent.memory.context import Context
 from react_agent.utils.tool_helpers import _ok, _err, _shrink_search_results, with_retry
 from react_agent.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # ================================================================================
@@ -18,15 +22,24 @@ from react_agent.core.config import settings
 #   - MAX_SEARCH_RESULTS：最多返回多少条搜索结果（可选，默认 5）
 @tool(
     description=(
-            "【仅限通用互联网信息】：本工具只能用于查询公开互联网上的通用信息。\n"
-            "【绝对禁止】：如果用户问题涉及任何金融报告、研究报告、内部文献、PDF文档、"
-            "数据库中的具体数据或数值，即使 query_internal_knowledge 返回结果不完整，"
-            "也绝对禁止调用本工具补充。直接用'文献未提及'填写缺失项。\n\n"
-            "使用互联网搜索引擎获取最新、公开的客观事实。\n"
-            "适用于：查找通用技术文档、开源代码库版本、新闻或核实基础概念。\n"
-            "【严格红线】：当用户的指令明确要求“对比本地文献”、“查阅内部知识库”，或涉及学术论文PDF的具体推导细节时，"
-            "绝对禁止调用此工具！即使内部知识库检索不到结果，也必须直接告知用户“未找到信息”，严禁使用本工具进行互联网兜底搜索。\n"
-            "输入必须是简洁的搜索关键词。"
+        "【触发条件】以下情况调用本工具：\n"
+        "  - 需要互联网上的最新动态、实时新闻、近期公告\n"
+        "  - 需要验证公开事实（公司官网信息、开源版本号、政策发布日期等）\n"
+        "  - query_internal_knowledge 已返回 has_relevant_content=False，"
+        "且用户问题属于可公开查询的宏观/行业信息\n"
+        "  示例 query：'2024年新能源补贴政策最新消息'、'比亚迪最新季报发布时间'\n\n"
+        "【不触发条件】以下情况禁止调用本工具：\n"
+        "  - 用户要求查询内部知识库中的具体财务数值或研报原文\n"
+        "  - query_internal_knowledge 尚未调用（不得跳过直接搜索）\n"
+        "  - 用户问题涉及私有文档中的具体数据，即使知识库未命中也不得用本工具补充\n\n"
+        "【输入】简洁的搜索关键词或短句，不超过300字符\n"
+        "  好的输入：'比亚迪 2024 Q3 业绩发布'\n"
+        "  差的输入：'请帮我在网上搜索所有关于比亚迪的信息'\n\n"
+        "【输出关键字段】\n"
+        "  data.results[].title     — 结果标题\n"
+        "  data.results[].url       — 来源链接，回答时应标注\n"
+        "  data.results[].content   — 摘要，最多800字\n"
+        "  data.results[].published_date — 发布日期，判断时效性用"
     )
 )
 @with_retry(
@@ -142,11 +155,16 @@ async def search(query: str) -> dict[str, Any]:
         wrapped = TavilySearch(max_results=max_results)
 
         # 调用搜索 API（Tavily 支持两种调用签名）
+        logger.info("[search] 发起 Tavily 请求 | query=%r | max_results=%s", q, max_results)
+        _t0 = time.perf_counter()
         try:
             raw = await wrapped.ainvoke({"query": q})
         except Exception:
             # 如果字典形式失败，尝试直接传字符串
             raw = await wrapped.ainvoke(q)
+        _elapsed = time.perf_counter() - _t0
+        _hit_count = len(raw.get("results", [])) if isinstance(raw, dict) else -1
+        logger.info("[search] Tavily 返回 | query=%r | 耗时=%.2fs | 命中=%d 条", q, _elapsed, _hit_count)
 
         # 裁剪结果以适应上下文
         data = _shrink_search_results(raw, max_items=min(5, max_results))

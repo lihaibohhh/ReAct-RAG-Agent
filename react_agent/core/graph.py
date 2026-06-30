@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph
 
 from react_agent.memory.context import Context
 from react_agent.core.state import InputState, State
-from react_agent.core.routing import route_model_output
+from react_agent.core.routing import route_model_output, route_after_postprocess
 from react_agent.core.checkpointer import CheckpointerFactory
 from react_agent.core.nodes import call_model, dynamic_tool_node, postprocess_tools, reflection_node
 
@@ -48,7 +48,7 @@ def build_base_graph() -> StateGraph:
     builder.add_edge("tools", "postprocess_tools")
 
     # Postprocess -> Reflection (✅ 关键改变：处理完结果后，先去反思节点检查有没有错)
-    builder.add_edge("postprocess_tools", "reflection")
+    builder.add_conditional_edges("postprocess_tools", route_after_postprocess)
 
     # Reflection -> Call Model (✅ 闭环：反思完（无论有错没错），都回模型继续思考)
     builder.add_edge("reflection", "call_model")

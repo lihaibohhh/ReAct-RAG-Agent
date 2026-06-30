@@ -4,6 +4,8 @@ from typing import Literal
 
 from langchain_core.messages import AIMessage
 from react_agent.core.state import State
+from react_agent.utils.tool_utils import _ai_tool_call_ids
+
 
 logger = logging.getLogger(__name__)
 
@@ -18,4 +20,12 @@ def route_model_output(state: State) -> Literal["__end__", "tools", "call_model"
             type(last_message).__name__,
         )
         return "call_model"
-    return "__end__" if not last_message.tool_calls else "tools"
+    return "tools" if _ai_tool_call_ids(last_message) else "__end__"
+
+
+def route_after_postprocess(state: State) -> Literal["__end__", "reflection"]:
+    """postprocess 注入了终态拒答 AIMessage（无 tool_calls）→ 直接结束；否则正常去 reflection。"""
+    last = state.messages[-1] if state.messages else None
+    if isinstance(last, AIMessage) and not last.tool_calls:
+        return "__end__"
+    return "reflection"

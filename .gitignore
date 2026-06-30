@@ -1,11 +1,50 @@
-.env
+# Python cache
 __pycache__/
-*.pyc
-outputs/
-*.sqlite3
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
 
-# 忽略所有的数据库和庞大的数据文件夹
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+mcp_debug.log
+
+# Runtime outputs
+outputs/
+
+# Local databases / checkpoints
+*.sqlite3
+*.sqlite3-*
+*.db
+agent_checkpoints.sqlite3
+
+# Vector DB / cache / local state
 chroma_db/
+data_sql/
+redis-data/
+redis_data/
+
+# Private datasets / evaluation outputs
 data/
-data(20260206)/
+eval/dataset/
+eval/results/
+ingestion_metrics.jsonl
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+
 隔离区文档/

@@ -23,6 +23,48 @@ logger = logging.getLogger(__name__)
 _retriever_instance = None
 _retriever_lock = threading.Lock()
 
+_retrieve_executor = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="rag-retrieve",
+)
+
+
+def _invoke_sync(name: str, fn, q: str) -> list:
+    """
+    在线程池中执行同步 retriever.invoke。
+
+    只在异常时记录日志，正常路径不刷诊断日志。
+    """
+    try:
+        return fn(q) or []
+    except Exception:
+        logger.exception("[RAG] %s invoke failed, degraded to empty result", name)
+        return []
+
+
+async def _invoke_retriever(name: str, fn, q: str) -> list:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _retrieve_executor,
+        _invoke_sync,
+        name,
+        fn,
+        q,
+    )
+
+
+# =============================================================
+
+
+def _log_retriever_diagnostic(event: str, instance: object | None = None) -> None:
+    if event == "init_start":
+        logger.info("[RAG] Retriever initializing")
+    elif event == "init_done":
+        logger.info("[RAG] Retriever initialized instance_id=%s", id(instance))
+    else:
+        logger.debug("[RAG] Retriever %s instance_id=%s", event, id(instance) if instance else None)
+
+
 # RISK-4 修复：独立线程池用于异步写入 Redis，不占用 _retriever_lock 持有时间
 _redis_save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bm25-redis-save")
 
@@ -189,12 +231,16 @@ def _get_retriever() -> dict:
 
     # 快速路径：已初始化，直接返回
     if _retriever_instance is not None:
+        _log_retriever_diagnostic("cache_hit", _retriever_instance)
         return _retriever_instance
 
     with _retriever_lock:
         # 二次检查：等锁期间可能已被其他线程初始化
         if _retriever_instance is not None:
+            _log_retriever_diagnostic("cache_hit", _retriever_instance)
             return _retriever_instance
+
+        _log_retriever_diagnostic("init_start")
 
         # 延迟导入，仅在首次初始化时触发
         try:
@@ -228,7 +274,9 @@ def _get_retriever() -> dict:
                 logger.info("[RAG] ⚠️ 知识库为空，本次降级为纯向量检索")
                 # BUG-4 修复：不写入 _retriever_instance，
                 #            允许知识库写入后下次调用自动恢复 BM25
-                return {"bm25": None, "vector": vector_retriever}
+                temporary_retriever = {"bm25": None, "vector": vector_retriever}
+                _log_retriever_diagnostic("init_done", temporary_retriever)
+                return temporary_retriever
 
             docs_for_bm25 = [
                 Document(page_content=text, metadata=meta)
@@ -246,6 +294,7 @@ def _get_retriever() -> dict:
             "vector": vector_retriever,
             "vectorstore": vectorstore,  # ← 把已有的对象也缓存进去
         }
+        _log_retriever_diagnostic("init_done", _retriever_instance)
         return _retriever_instance
 
 
@@ -257,53 +306,21 @@ async def _dual_retrieve(q: str) -> list:
 
     bm25 = retriever.get("bm25")
     vector = retriever.get("vector")
-    # vectorstore = retriever.get("vectorstore")  # ← 取出
-    #
-    # # 判断是否命中行业
-    # industry = _detect_industry(q)
-    #
-    # if industry and vectorstore:
-    #     vector_task = asyncio.to_thread(
-    #         vectorstore.similarity_search, q, k=_BM25_TOP_K,
-    #         filter={"industry": industry},
-    #     )
-    # else:
-    #     vector_task = asyncio.to_thread(vector.invoke, q)
-    #
-    # if bm25 is not None:
-    #     bm25_docs, vector_docs = await asyncio.gather(
-    #         asyncio.to_thread(bm25.invoke, q),
-    #         vector_task,
-    #     )
-    # else:
-    #     vector_docs = await vector_task
-    #     bm25_docs = []
-    #
-    # rrf_scores: dict[str, float] = {}
-    # doc_map:    dict[str, object] = {}
-    #
-    # def get_key(doc) -> str:
-    #     # RISK-3 修复：用 None 显式检查，避免 chunk_id="" 被 falsy 判断误判
-    #     # RISK-2 注：若知识库存在前100字相同的不同文档，应在 ingest 阶段确保 chunk_id 唯一
-    #     cid = doc.metadata.get("chunk_id")
-    #
-    #     # 如果chunk_id因异常情况被赋值为""，即chunk_id为空字符串时依旧是True，避免RISK-2
-    #     return cid if cid is not None else doc.page_content[:100]
-    #
-    # if industry:
-    #     bm25_docs = sorted(
-    #         bm25_docs,
-    #         key=lambda d: 0 if d.metadata.get("industry") == industry else 1,
-    #     )
 
-    if bm25 is not None:
+    if bm25 is not None and vector is not None:
         bm25_docs, vector_docs = await asyncio.gather(
-            asyncio.to_thread(bm25.invoke, q),
-            asyncio.to_thread(vector.invoke, q),
+            _invoke_retriever("bm25", bm25.invoke, q),
+            _invoke_retriever("vector", vector.invoke, q),
         )
-    else:
-        vector_docs = await asyncio.to_thread(vector.invoke, q)
+    elif vector is not None:
+        vector_docs = await _invoke_retriever("vector", vector.invoke, q)
         bm25_docs = []
+    elif bm25 is not None:
+        bm25_docs = await _invoke_retriever("bm25", bm25.invoke, q)
+        vector_docs = []
+    else:
+        logger.warning("[RAG] both bm25 and vector retrievers are unavailable")
+        return []
 
     rrf_scores: dict[str, float] = {}
     doc_map:    dict[str, object] = {}

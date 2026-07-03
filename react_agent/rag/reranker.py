@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import asyncio
 import threading
 import logging
@@ -12,6 +13,19 @@ logger = logging.getLogger(__name__)
 _reranker_retriever_instance = None     # 缓存 BGE Reranker 精排器
 _reranker_lock = threading.Lock()       # 线程安全锁：保护 _reranker_retriever_instance 初始化
 
+
+def _log_reranker_diagnostic(event: str, instance: object | None = None) -> None:
+    logger.info(
+        "[RAG][RerankerDiag] event=%s pid=%s thread=%s module_name=%s module_file=%s module_id=%s instance_id=%s device=%s",
+        event,
+        os.getpid(),
+        threading.current_thread().name,
+        __name__,
+        __file__,
+        id(sys.modules[__name__]),
+        id(instance) if instance is not None else None,
+        _DEVICE,
+    )
 
 def _get_reranker():
     """
@@ -27,11 +41,15 @@ def _get_reranker():
     global _reranker_retriever_instance
 
     if _reranker_retriever_instance is not None:
+        _log_reranker_diagnostic("cache_hit", _reranker_retriever_instance)
         return _reranker_retriever_instance
 
     with _reranker_lock:
         if _reranker_retriever_instance is not None:
+            _log_reranker_diagnostic("cache_hit", _reranker_retriever_instance)
             return _reranker_retriever_instance
+
+        _log_reranker_diagnostic("init_start")
 
         try:
             from langchain_community.cross_encoders import HuggingFaceCrossEncoder
@@ -44,6 +62,7 @@ def _get_reranker():
         logger.info(f"[RAG] ✅ Reranker 初始化完成（{model_name}）")
 
         _reranker_retriever_instance = reranker_model
+        _log_reranker_diagnostic("init_done", _reranker_retriever_instance)
         return _reranker_retriever_instance
 
 

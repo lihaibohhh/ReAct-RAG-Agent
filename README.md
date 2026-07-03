@@ -16,7 +16,8 @@
 - 结合联网搜索补充公开信息；
 - 调用工具生成 Excel、Word、Markdown 等结构化交付物；
 - 通过 Checkpoint 持久化保存会话上下文，支持多轮追问；
-- 通过 Streamlit UI 和 FastAPI REST / SSE 双入口接入前端或外部系统。
+- 通过 Streamlit UI 和 FastAPI REST / SSE 双入口接入前端或外部系统；
+- 通过 MCP Server 将金融研报 RAG 能力接入支持 MCP 的客户端。
 
 > 本仓库不包含私有研报数据、向量库、密钥、运行日志和本地数据库。请通过 `.env.example` 配置环境变量，并将自己的 PDF / 数据文件放入本地忽略目录中。
 
@@ -32,6 +33,7 @@
 | **多工具输出** | Web 搜索、知识库检索、Excel、Word、Markdown，Text2SQL 模块可按需启用 |
 | **记忆与隔离** | Checkpointer 支持 SQLite / PostgreSQL / Redis / Memory，多用户 thread 命名空间隔离 |
 | **服务化** | FastAPI v1 API，token 级 SSE 流式，断连取消上游 LLM，统一错误信封，request_id 日志 |
+| **MCP 接入** | stdio 模式 MCP Server，向 Claude Desktop / Cursor / Claude Code / MCP Inspector 暴露 RAG 查询、知识库检查与预热工具 |
 | **安全与成本控制** | API Key 鉴权，匿名 IP 限流，Redis 固定窗口限流，每日 token 预算，fail-open 降级 |
 | **可观测性** | Prometheus 指标采集：HTTP 延迟、in-flight、TTFT、tokens、成本、429 / 401 |
 | **测试与 CI** | FastAPI 回归测试使用 FakeAgent + fakeredis，避免真实 LLM / Redis 调用，做到零烧钱测试 |
@@ -155,6 +157,39 @@ FastAPI 与 Streamlit 并存，共享同一套 Agent 实例与持久化存储。
 | 限流与预算 | Redis 固定分钟窗口限流 + per-user 每日 token 预算 |
 | 可观测 | Prometheus 指标采集 HTTP 延迟、TTFT、tokens、cost、in-flight、429 / 401 |
 | 会话管理 | history / delete session，bucket_key 命名空间隔离，防 IDOR 越权读取 |
+
+
+---
+
+### 5.5 MCP Server：外部 MCP 客户端接入
+
+本项目新增 stdio 模式 MCP Server，用于将金融研报 RAG 能力接入 Claude Desktop、Cursor、Claude Code、MCP Inspector 等支持 MCP 的客户端。
+
+| 文件 | 职责 |
+|---|---|
+| `src/mcp_rag_server.py` | MCP stdio 薄启动入口；负责路径锚定、Windows UTF-8 流修复、加载 `.env`、配置日志并启动 server |
+| `react_agent/mcp_server/app.py` | MCP Server 创建与工具注册入口 |
+| `react_agent/mcp_server/info_tools.py` | 注册 `server_info`，返回 MCP Server 基本信息 |
+| `react_agent/mcp_server/health_tools.py` | 注册 `check_knowledge_base`，检查知识库与向量库可用性 |
+| `react_agent/mcp_server/warmup_tools.py` | 注册 RAG 预热工具：轻量预热、后台完整预热、预热状态查询 |
+| `react_agent/mcp_server/rag_tools.py` | 注册 `query_financial_reports`，对外暴露金融研报 RAG 查询 |
+| `react_agent/mcp_server/responses.py` | 统一 MCP 工具返回结构，如 `mcp_ok` / `mcp_err` |
+
+MCP 启动方式：
+
+```bash
+cd src
+python mcp_rag_server.py
+```
+
+使用 MCP Inspector 测试：
+
+```bash
+cd src
+npx -y @modelcontextprotocol/inspector -- python mcp_rag_server.py
+```
+
+MCP 启动入口遵循“薄启动”原则：启动阶段不预热 embedding、reranker、Chroma、Redis 等重资源，避免 stdio 握手阶段阻塞；重资源在具体工具调用时懒加载，并通过显式 warmup 工具提前触发。
 
 ---
 
@@ -352,6 +387,32 @@ DeepSeek / LangChain 工具调用中，复杂工具参数可能进入 `.invalid_
 - Prometheus 指标；
 - 零真实依赖的回归测试。
 
+
+### 9.6 MCP RAG 冷启动处理
+
+MCP 改造中遇到的问题：旧版轻量预热只加载 retriever / reranker 并执行 dummy rerank，没有覆盖真实 `_dual_retrieve()`、`bm25.invoke()`、`vector.invoke()` 与真实 rerank。结果是第一次 `query_financial_reports` 仍可能承担完整检索冷路径，若前台同步等待过久，MCP 客户端可能取消请求。
+
+已落地的处理方式：
+
+- `mcp_rag_server.py` 改为 stdio 薄启动入口，启动时不做重资源预热；
+- MCP 相关工具拆分到 `react_agent/mcp_server/` 目录，按职责模块化注册；
+- 保留轻量预热工具，用于加载 retriever / reranker 并触发 dummy rerank；
+- 新增后台完整预热工具，异步触发完整 RAG 链路，立即返回，不让 MCP 客户端同步等待；
+- 新增预热状态查询工具，用于轮询后台 full warmup 是否完成；
+- RAG 查询工具保留语义缓存命中路径，减少重复查询成本。
+
+推荐使用流程：
+
+```text
+1. List Tools
+2. warmup_rag_pipeline
+3. start_full_warmup_rag_pipeline
+4. get_full_warmup_status，直到 state=done
+5. query_financial_reports
+```
+
+当前已确认的问题边界：工程层面已确定旧版预热覆盖不完整，且前台同步等待首次真实检索会带来 MCP 客户端超时风险；但某些轮次中 `bm25.invoke()` / `vector.invoke()` 首次执行异常变慢的更底层原因尚未完全确定，不能断定为 Hugging Face 下载、Chroma、文件系统缓存、进程状态或资源争用中的某一个。
+
 ---
 
 ## 10. 目录结构
@@ -376,12 +437,20 @@ react-agent-main/
     │   ├── core/                    # LangGraph 工作流、节点、路由、状态、checkpointer
     │   ├── rag/                     # PDF 解析、分块、召回、精排、语义缓存、向量库
     │   ├── tools/                   # RAG / Search / Excel / Word / Markdown / SQL
+    │   ├── mcp_server/              # MCP 工具注册与 stdio Server 模块
+    │   │   ├── app.py               # 创建 MCP Server 并注册工具
+    │   │   ├── info_tools.py        # server_info
+    │   │   ├── health_tools.py      # check_knowledge_base
+    │   │   ├── warmup_tools.py      # warmup / background full warmup / status
+    │   │   ├── rag_tools.py         # query_financial_reports
+    │   │   └── responses.py         # mcp_ok / mcp_err 返回结构
     │   ├── memory/                  # Context 配置
     │   └── utils/                   # LLM、Redis、token、tool helpers
     ├── eval/                        # RAGAS 评测脚本与数据生成
     ├── scripts/                     # PDF 检查、财务抽取、Redis 检查、历史管理
     ├── tests/                       # Streamlit 入口与 API 回归测试
     ├── config.yaml                  # 运行时配置
+    ├── mcp_rag_server.py            # MCP stdio 薄启动入口
     ├── pyproject.toml
     ├── requirements.txt
     ├── .env.example
@@ -400,10 +469,19 @@ react-agent-main/
 | token 预算事后扣费 | 单条超长请求可能先超过预算 | 增加单请求 max_tokens 硬限制 |
 | 历史工具链干扰 | 已用 Guard 和跨轮计数缓解 | 将上一轮 tool call chain 压缩为中性摘要 |
 | psycopg pool | 隐式 open 有弃用风险 | 改为显式 `await pool.open()` 或上下文管理 |
+| MCP 首次完整检索长尾 | 已通过后台 full warmup 规避前台超时风险 | 继续独立压测 `bm25.invoke()` / `vector.invoke()` / Chroma 查询，定位偶发长尾的底层触发点 |
 
 ---
 
 ## 12. 更新日志
+
+### 2026-07-02：MCP Server 模块化与 RAG 预热改造
+
+- 将 MCP 工具拆分到 `react_agent/mcp_server/`，新增 `app.py`、`responses.py`、`info_tools.py`、`health_tools.py`、`warmup_tools.py`、`rag_tools.py`；
+- 改造 `mcp_rag_server.py` 为 stdio 薄启动入口：路径锚定、Windows UTF-8 流修复、`.env` 加载、stderr + file 日志，不在握手阶段预热重资源；
+- 新增轻量 RAG warmup、后台完整 RAG warmup 与 warmup 状态查询，降低第一次 `query_financial_reports` 暴露冷启动的概率；
+- 确认旧版轻量 warmup 未覆盖 `_dual_retrieve()`、`bm25.invoke()`、`vector.invoke()` 与真实 rerank，可能导致首次查询仍承担完整冷路径；
+- 目前尚未完全确定某些轮次中首次 `bm25.invoke()` / `vector.invoke()` 异常变慢的底层触发点，文档中不将其归因到单一组件。
 
 ### 2026-06-28：工具调用协议健壮性
 
